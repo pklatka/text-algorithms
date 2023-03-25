@@ -1,0 +1,290 @@
+// SPDX-License-Identifier: GPL-2.0 or BSD-3-Clause
+/*
+ * Copyright(c) 2015 - 2020 Intel Corporation.
+ * Copyright(c) 2021 Cornelis Networks.
+ */
+
+/*
+ * This file contains all of the code that is specific to the HFI chip
+ */
+
+#include <linux/pci.h>
+#include <linux/delay.h>
+#include <linux/interrupt.h>
+#include <linux/module.h>
+
+#include "hfi.h"
+#include "trace.h"
+#include "mad.h"
+#include "pio.h"
+#include "sdma.h"
+#include "eprom.h"
+#include "efivar.h"
+#include "platform.h"
+#include "aspm.h"
+#include "affinity.h"
+#include "debugfs.h"
+#include "fault.h"
+#include "netdev.h"
+
+uint num_vls = HFI1_MAX_VLS_SUPPORTED;
+module_param(num_vls, uint, S_IRUGO);
+MODULE_PARM_DESC(num_vls, "Set number of Virtual Lanes to use (1-8)");
+
+/*
+ * Default time to aggregate two 10K packets from the idle state
+ * (timer not running). The timer starts at the end of the first packet,
+ * so only the time for one 10K packet and header plus a bit extra is needed.
+ * 10 * 1024 + 64 header byte = 10304 byte
+ * 10304 byte / 12.5 GB/s = 824.32ns
+ */
+uint rcv_intr_timeout = (824 + 16); /* 16 is for coalescing interrupt */
+module_param(rcv_intr_timeout, uint, S_IRUGO);
+MODULE_PARM_DESC(rcv_intr_timeout, "Receive interrupt mitigation timeout in ns");
+
+uint rcv_intr_count = 16; /* same as qib */
+module_param(rcv_intr_count, uint, S_IRUGO);
+MODULE_PARM_DESC(rcv_intr_count, "Receive interrupt mitigation count");
+
+ushort link_crc_mask = SUPPORTED_CRCS;
+module_param(link_crc_mask, ushort, S_IRUGO);
+MODULE_PARM_DESC(link_crc_mask, "CRCs to use on the link");
+
+uint loopback;
+module_param_named(loopback, loopback, uint, S_IRUGO);
+MODULE_PARM_DESC(loopback, "Put into loopback mode (1 = serdes, 3 = external cable");
+
+/* Other driver tunables */
+uint rcv_intr_dynamic = 1; /* enable dynamic mode for rcv int mitigation*/
+static ushort crc_14b_sideband = 1;
+static uint use_flr = 1;
+uint quick_linkup; /* skip LNI */
+
+struct flag_table {
+	u64 flag;	/* the flag */
+	char *str;	/* description string */
+	u16 extra;	/* extra information */
+	u16 unused0;
+	u32 unused1;
+};
+
+/* str must be a string constant */
+#define FLAG_ENTRY(str, extra, flag) {flag, str, extra}
+#define FLAG_ENTRY0(str, flag) {flag, str, 0}
+
+/* Send Error Consequences */
+#define SEC_WRITE_DROPPED	0x1
+#define SEC_PACKET_DROPPED	0x2
+#define SEC_SC_HALTED		0x4	/* per-context only */
+#define SEC_SPC_FREEZE		0x8	/* per-HFI only */
+
+#define DEFAULT_KRCVQS		  2
+#define MIN_KERNEL_KCTXTS         2
+#define FIRST_KERNEL_KCTXT        1
+
+/*
+ * RSM instance allocation
+ *   0 - User Fecn Handling
+ *   1 - Vnic
+ *   2 - AIP
+ *   3 - Verbs
+ */
+#define RSM_INS_FECN              0
+#define RSM_INS_VNIC              1
+#define RSM_INS_AIP               2
+#define RSM_INS_VERBS             3
+
+/* Bit offset into the GUID which carries HFI id information */
+#define GUID_HFI_INDEX_SHIFT     39
+
+/* extract the emulation revision */
+#define emulator_rev(dd) ((dd)->irev >> 8)
+/* parallel and serial emulation versions are 3 and 4 respectively */
+#define is_emulator_p(dd) ((((dd)->irev) & 0xf) == 3)
+#define is_emulator_s(dd) ((((dd)->irev) & 0xf) == 4)
+
+/* RSM fields for Verbs */
+/* packet type */
+#define IB_PACKET_TYPE         2ull
+#define QW_SHIFT               6ull
+/* QPN[7..1] */
+#define QPN_WIDTH              7ull
+
+/* LRH.BTH: QW 0, OFFSET 48 - for match */
+#define LRH_BTH_QW             0ull
+#define LRH_BTH_BIT_OFFSET     48ull
+#define LRH_BTH_OFFSET(off)    ((LRH_BTH_QW << QW_SHIFT) | (off))
+#define LRH_BTH_MATCH_OFFSET   LRH_BTH_OFFSET(LRH_BTH_BIT_OFFSET)
+#define LRH_BTH_SELECT
+#define LRH_BTH_MASK           3ull
+#define LRH_BTH_VALUE          2ull
+
+/* LRH.SC[3..0] QW 0, OFFSET 56 - for match */
+#define LRH_SC_QW              0ull
+#define LRH_SC_BIT_OFFSET      56ull
+#define LRH_SC_OFFSET(off)     ((LRH_SC_QW << QW_SHIFT) | (off))
+#define LRH_SC_MATCH_OFFSET    LRH_SC_OFFSET(LRH_SC_BIT_OFFSET)
+#define LRH_SC_MASK            128ull
+#define LRH_SC_VALUE           0ull
+
+/* SC[n..0] QW 0, OFFSET 60 - for select */
+#define LRH_SC_SELECT_OFFSET  ((LRH_SC_QW << QW_SHIFT) | (60ull))
+
+/* QPN[m+n:1] QW 1, OFFSET 1 */
+#define QPN_SELECT_OFFSET      ((1ull << QW_SHIFT) | (1ull))
+
+/* RSM fields for AIP */
+/* LRH.BTH above is reused for this rule */
+
+/* BTH.DESTQP: QW 1, OFFSET 16 for match */
+#define BTH_DESTQP_QW           1ull
+#define BTH_DESTQP_BIT_OFFSET   16ull
+#define BTH_DESTQP_OFFSET(off) ((BTH_DESTQP_QW << QW_SHIFT) | (off))
+#define BTH_DESTQP_MATCH_OFFSET BTH_DESTQP_OFFSET(BTH_DESTQP_BIT_OFFSET)
+#define BTH_DESTQP_MASK         0xFFull
+#define BTH_DESTQP_VALUE        0x81ull
+
+/* DETH.SQPN: QW 1 Offset 56 for select */
+/* We use 8 most significant Soure QPN bits as entropy fpr AIP */
+#define DETH_AIP_SQPN_QW 3ull
+#define DETH_AIP_SQPN_BIT_OFFSET 56ull
+#define DETH_AIP_SQPN_OFFSET(off) ((DETH_AIP_SQPN_QW << QW_SHIFT) | (off))
+#define DETH_AIP_SQPN_SELECT_OFFSET \
+	DETH_AIP_SQPN_OFFSET(DETH_AIP_SQPN_BIT_OFFSET)
+
+/* RSM fields for Vnic */
+/* L2_TYPE: QW 0, OFFSET 61 - for match */
+#define L2_TYPE_QW             0ull
+#define L2_TYPE_BIT_OFFSET     61ull
+#define L2_TYPE_OFFSET(off)    ((L2_TYPE_QW << QW_SHIFT) | (off))
+#define L2_TYPE_MATCH_OFFSET   L2_TYPE_OFFSET(L2_TYPE_BIT_OFFSET)
+#define L2_TYPE_MASK           3ull
+#define L2_16B_VALUE           2ull
+
+/* L4_TYPE QW 1, OFFSET 0 - for match */
+#define L4_TYPE_QW              1ull
+#define L4_TYPE_BIT_OFFSET      0ull
+#define L4_TYPE_OFFSET(off)     ((L4_TYPE_QW << QW_SHIFT) | (off))
+#define L4_TYPE_MATCH_OFFSET    L4_TYPE_OFFSET(L4_TYPE_BIT_OFFSET)
+#define L4_16B_TYPE_MASK        0xFFull
+#define L4_16B_ETH_VALUE        0x78ull
+
+/* 16B VESWID - for select */
+#define L4_16B_HDR_VESWID_OFFSET  ((2 << QW_SHIFT) | (16ull))
+/* 16B ENTROPY - for select */
+#define L2_16B_ENTROPY_OFFSET     ((1 << QW_SHIFT) | (32ull))
+
+/* defines to build power on SC2VL table */
+#define SC2VL_VAL( \
+	num, \
+	sc0, sc0val, \
+	sc1, sc1val, \
+	sc2, sc2val, \
+	sc3, sc3val, \
+	sc4, sc4val, \
+	sc5, sc5val, \
+	sc6, sc6val, \
+	sc7, sc7val) \
+( \
+	((u64)(sc0val) << SEND_SC2VLT##num##_SC##sc0##_SHIFT) | \
+	((u64)(sc1val) << SEND_SC2VLT##num##_SC##sc1##_SHIFT) | \
+	((u64)(sc2val) << SEND_SC2VLT##num##_SC##sc2##_SHIFT) | \
+	((u64)(sc3val) << SEND_SC2VLT##num##_SC##sc3##_SHIFT) | \
+	((u64)(sc4val) << SEND_SC2VLT##num##_SC##sc4##_SHIFT) | \
+	((u64)(sc5val) << SEND_SC2VLT##num##_SC##sc5##_SHIFT) | \
+	((u64)(sc6val) << SEND_SC2VLT##num##_SC##sc6##_SHIFT) | \
+	((u64)(sc7val) << SEND_SC2VLT##num##_SC##sc7##_SHIFT)   \
+)
+
+#define DC_SC_VL_VAL( \
+	range, \
+	e0, e0val, \
+	e1, e1val, \
+	e2, e2val, \
+	e3, e3val, \
+	e4, e4val, \
+	e5, e5val, \
+	e6, e6val, \
+	e7, e7val, \
+	e8, e8val, \
+	e9, e9val, \
+	e10, e10val, \
+	e11, e11val, \
+	e12, e12val, \
+	e13, e13val, \
+	e14, e14val, \
+	e15, e15val) \
+( \
+	((u64)(e0val) << DCC_CFG_SC_VL_TABLE_##range##_ENTRY##e0##_SHIFT) | \
+	((u64)(e1val) << DCC_CFG_SC_VL_TABLE_##range##_ENTRY##e1##_SHIFT) | \
+	((u64)(e2val) << DCC_CFG_SC_VL_TABLE_##range##_ENTRY##e2##_SHIFT) | \
+	((u64)(e3val) << DCC_CFG_SC_VL_TABLE_##range##_ENTRY##e3##_SHIFT) | \
+	((u64)(e4val) << DCC_CFG_SC_VL_TABLE_##range##_ENTRY##e4##_SHIFT) | \
+	((u64)(e5val) << DCC_CFG_SC_VL_TABLE_##range##_ENTRY##e5##_SHIFT) | \
+	((u64)(e6val) << DCC_CFG_SC_VL_TABLE_##range##_ENTRY##e6##_SHIFT) | \
+	((u64)(e7val) << DCC_CFG_SC_VL_TABLE_##range##_ENTRY##e7##_SHIFT) | \
+	((u64)(e8val) << DCC_CFG_SC_VL_TABLE_##range##_ENTRY##e8##_SHIFT) | \
+	((u64)(e9val) << DCC_CFG_SC_VL_TABLE_##range##_ENTRY##e9##_SHIFT) | \
+	((u64)(e10val) << DCC_CFG_SC_VL_TABLE_##range##_ENTRY##e10##_SHIFT) | \
+	((u64)(e11val) << DCC_CFG_SC_VL_TABLE_##range##_ENTRY##e11##_SHIFT) | \
+	((u64)(e12val) << DCC_CFG_SC_VL_TABLE_##range##_ENTRY##e12##_SHIFT) | \
+	((u64)(e13val) << DCC_CFG_SC_VL_TABLE_##range##_ENTRY##e13##_SHIFT) | \
+	((u64)(e14val) << DCC_CFG_SC_VL_TABLE_##range##_ENTRY##e14##_SHIFT) | \
+	((u64)(e15val) << DCC_CFG_SC_VL_TABLE_##range##_ENTRY##e15##_SHIFT) \
+)
+
+/* all CceStatus sub-block freeze bits */
+#define ALL_FROZE (CCE_STATUS_SDMA_FROZE_SMASK \
+			| CCE_STATUS_RXE_FROZE_SMASK \
+			| CCE_STATUS_TXE_FROZE_SMASK \
+			| CCE_STATUS_TXE_PIO_FROZE_SMASK)
+/* all CceStatus sub-block TXE pause bits */
+#define ALL_TXE_PAUSE (CCE_STATUS_TXE_PIO_PAUSED_SMASK \
+			| CCE_STATUS_TXE_PAUSED_SMASK \
+			| CCE_STATUS_SDMA_PAUSED_SMASK)
+/* all CceStatus sub-block RXE pause bits */
+#define ALL_RXE_PAUSE CCE_STATUS_RXE_PAUSED_SMASK
+
+#define CNTR_MAX 0xFFFFFFFFFFFFFFFFULL
+#define CNTR_32BIT_MAX 0x00000000FFFFFFFF
+
+/*
+ * CCE Error flags.
+ */
+static struct flag_table cce_err_status_flags[] = {
+/* 0*/	FLAG_ENTRY0("CceCsrParityErr",
+		CCE_ERR_STATUS_CCE_CSR_PARITY_ERR_SMASK),
+/* 1*/	FLAG_ENTRY0("CceCsrReadBadAddrErr",
+		CCE_ERR_STATUS_CCE_CSR_READ_BAD_ADDR_ERR_SMASK),
+/* 2*/	FLAG_ENTRY0("CceCsrWriteBadAddrErr",
+		CCE_ERR_STATUS_CCE_CSR_WRITE_BAD_ADDR_ERR_SMASK),
+/* 3*/	FLAG_ENTRY0("CceTrgtAsyncFifoParityErr",
+		CCE_ERR_STATUS_CCE_TRGT_ASYNC_FIFO_PARITY_ERR_SMASK),
+/* 4*/	FLAG_ENTRY0("CceTrgtAccessErr",
+		CCE_ERR_STATUS_CCE_TRGT_ACCESS_ERR_SMASK),
+/* 5*/	FLAG_ENTRY0("CceRspdDataParityErr",
+		CCE_ERR_STATUS_CCE_RSPD_DATA_PARITY_ERR_SMASK),
+/* 6*/	FLAG_ENTRY0("CceCli0AsyncFifoParityErr",
+		CCE_ERR_STATUS_CCE_CLI0_ASYNC_FIFO_PARITY_ERR_SMASK),
+/* 7*/	FLAG_ENTRY0("CceCsrCfgBusParityErr",
+		CCE_ERR_STATUS_CCE_CSR_CFG_BUS_PARITY_ERR_SMASK),
+/* 8*/	FLAG_ENTRY0("CceCli2AsyncFifoParityErr",
+		CCE_ERR_STATUS_CCE_CLI2_ASYNC_FIFO_PARITY_ERR_SMASK),
+/* 9*/	FLAG_ENTRY0("CceCli1AsyncFifoPioCrdtParityErr",
+	    CCE_ERR_STATUS_CCE_CLI1_ASYNC_FIFO_PIO_CRDT_PARITY_ERR_SMASK),
+/*10*/	FLAG_ENTRY0("CceCli1AsyncFifoPioCrdtParityErr",
+	    CCE_ERR_STATUS_CCE_CLI1_ASYNC_FIFO_SDMA_HD_PARITY_ERR_SMASK),
+/*11*/	FLAG_ENTRY0("CceCli1AsyncFifoRxdmaParityError",
+	    CCE_ERR_STATUS_CCE_CLI1_ASYNC_FIFO_RXDMA_PARITY_ERROR_SMASK),
+/*12*/	FLAG_ENTRY0("CceCli1AsyncFifoDbgParityError",
+		CCE_ERR_STATUS_CCE_CLI1_ASYNC_FIFO_DBG_PARITY_ERROR_SMASK),
+/*13*/	FLAG_ENTRY0("PcicRetryMemCorErr",
+		CCE_ERR_STATUS_PCIC_RETRY_MEM_COR_ERR_SMASK),
+/*14*/	FLAG_ENTRY0("PcicRetryMemCorErr",
+		CCE_ERR_STATUS_PCIC_RETRY_SOT_MEM_COR_ERR_SMASK),
+/*15*/	FLAG_ENTRY0("PcicPostHdQCorErr",
+		CCE_ERR_STATUS_PCIC_POST_HD_QCOR_ERR_SMASK),
+/*16*/	FLAG_ENTRY0("PcicPostHdQCorErr",
+		CCE_ERR_STATUS_PCIC_POST_DAT_QCOR_ERR_SMASK),
+/*17*/	FLAG_ENTRY0("PcicPostHdQCorErr",
+		CCE_ERR_STATUS_PCIC_CPL_HD_Q
