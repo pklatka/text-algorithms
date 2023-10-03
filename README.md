@@ -2,7 +2,7 @@
 
 This repository consists of solutions for text algorithms course at AGH UST. Every task is in a separate folder. Solutions were written using Python. Each folder contains a task description in Polish.
 
-## Short descriptions of given tasks
+## Tasks
 
 - [lab1](https://github.com/pklatka/text-algorithms-course/tree/main/Lab%2001): pattern searching algorithms
 - [lab2](https://github.com/pklatka/text-algorithms-course/tree/main/Lab%2002): compression algorithms
