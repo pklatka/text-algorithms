@@ -1,6 +1,6 @@
 # Text algorithms course
 
-This repository consists of solutions for text algorithms course at AGH UST. Every task is in a separate folder. Solutions were written using Python. Each folder contains a task description in Polish.
+This repository contains solutions for text algorithms course at AGH UST. Every task is in a separate folder. Solutions were written using Python. Each folder contains a task description in Polish.
 
 ## Tasks
 
